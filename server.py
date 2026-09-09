@@ -61,6 +61,8 @@ def load_config() -> dict[str, Any]:
                 "daily_limit": 1000,
                 "rpm_limit": 15,
                 "timeout_seconds": 15,
+                "client_id": "",
+                "client_secret": "",
             },
         },
     }
@@ -221,6 +223,8 @@ def build_snapshot(config: dict[str, Any]) -> dict[str, Any]:
                 "daily_limit": int(providers_cfg.get("gemini", {}).get("daily_limit", 1000)),
                 "rpm_limit": int(providers_cfg.get("gemini", {}).get("rpm_limit", 15)),
                 "timeout_seconds": int(providers_cfg.get("gemini", {}).get("timeout_seconds", 15)),
+                "client_id": providers_cfg.get("gemini", {}).get("client_id", ""),
+                "client_secret": providers_cfg.get("gemini", {}).get("client_secret", ""),
             },
         ),
     ]
@@ -278,9 +282,26 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def _send_dashboard(self) -> None:
+        page = ROOT / "dashboard.html"
+        if not page.exists():
+            self._send_json(404, {"ok": False, "error": "dashboard.html not found"})
+            return
+        encoded = page.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(encoded)
+
     def do_GET(self) -> None:  # noqa: N802
         config = load_config()
         path = urlparse(self.path).path
+
+        if path in ("/", "/index.html", "/dashboard.html"):
+            self._send_dashboard()
+            return
 
         if path == "/health":
             health: dict[str, Any] = {
