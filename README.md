@@ -119,23 +119,30 @@ CLAUDE_SESSION_KEY=sk-ant-sid-...
 
 ### Enabling Gemini
 
-The Gemini provider uses the same OAuth credentials as the Gemini CLI — **no API key, no billing**. It calls the Gemini API as your Google account's personal free quota and auto-refreshes the access token using the stored refresh token.
+The Gemini provider uses the same OAuth credentials as the Gemini CLI — **no API key, no billing**. It probes the Code Assist backend that the `gemini` CLI itself uses (`cloudcode-pa.googleapis.com/v1internal:countTokens`) as your Google account's personal free quota, and auto-refreshes the access token using the stored refresh token.
 
-**One-time setup on the gateway machine:**
+**One-time setup:**
 
-```bash
-# Copy credentials from your dev machine to the gateway server
-scp ~/.gemini/oauth_creds.json mole@ash:/etc/gemini-oauth-creds.json
+1. On the gateway machine, log in with the Gemini CLI (`gemini`, with `security.auth.selectedType: "oauth-personal"` in `~/.gemini/settings.json`) and complete the browser sign-in. This creates `~/.gemini/oauth_creds.json`.
+2. Enable the provider in `config.json` (or via env):
+
+```json
+{ "providers": { "gemini": { "enabled": true } } }
 ```
-
-Then add to `/etc/coding-limits.env`:
 
 ```
 GEMINI_ENABLED=true
-GEMINI_CREDS_FILE=/etc/gemini-oauth-creds.json
 ```
 
-The provider auto-refreshes the access token (valid 1 hour) using the refresh token in the file. When Google eventually invalidates the refresh token (rare — typically only on password change or account revocation), re-copy the credentials file from your dev machine.
+**Token refresh needs a client pair, and it is found in this order:**
+
+1. `client_id`/`client_secret` inside the credentials file (or its `oauth_pairs` list),
+2. `providers.gemini.client_id`/`client_secret` in `config.json`,
+3. the gemini CLI's public installed-app pair, built into the provider (it is a public constant in `@google/gemini-cli-core`).
+
+Because of the built-in fallback, re-logging in with the `gemini` CLI (which rewrites the credentials file without the pair) does **not** break refresh — the provider falls back to the CLI pair and writes it back into the file.
+
+When Google eventually invalidates the refresh token (rare — typically only on password change or account revocation), re-login with the `gemini` CLI.
 
 > **Note:** Google does not expose remaining quota in successful API responses, so `usedPercent` will be `null` when not rate-limited. The bars on the display will show `--`. If a 429 is hit, the relevant window (RPM or RPD) fills to 100% with a reset countdown.
 
@@ -216,6 +223,7 @@ Requires `X-Gauge-Token` header if `ACCESS_TOKEN` is set. Calls all enabled prov
 
 ## Clients
 
+- **hud/** (in this repo) — Windows tray app (WinForms, .NET 9): a semi-transparent, always-on-top HUD in the corner of your screen with per-provider usage rings. It also starts and supervises the gateway (replacing the retired `tray.py` launcher) and can auto-start at Windows login. See [hud/README.md](hud/README.md).
 - **[esp32-coding-limits](https://github.com/mortenlein/esp32-coding-limits)** — ESP32-S3 firmware that displays live provider bars on a small TFT screen.
 
 ---

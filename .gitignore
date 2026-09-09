@@ -5,3 +5,12 @@ __pycache__/
 config.json
 *.egg-info/
 .pytest_cache/
+
+# .NET build artifacts
+bin/
+obj/
+*.user
+
+# Runtime logs
+logs/
+gateway.log*
