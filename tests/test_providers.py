@@ -314,6 +314,46 @@ class GeminiProviderTests(unittest.TestCase):
         self.assertTrue(data["ok"])
         self.assertEqual(call_count[0], 2)
 
+    @patch("providers.gemini._discover_cli_client_pairs",
+           return_value=[("fake-cli-id", "fake-cli-secret")])
+    @patch("providers.gemini.urlopen")
+    def test_refresh_falls_back_to_builtin_cli_pair(self, mock_urlopen, _mock_discover):
+        import tempfile
+        import providers.gemini as gemini_mod
+        captured_bodies: list[str] = []
+
+        class FakeResp:
+            def __init__(self, body): self._body = body
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def read(self): return json.dumps(self._body).encode()
+            headers = MagicMock()
+
+        def side_effect(req, timeout=None):
+            captured_bodies.append(req.data.decode())
+            body = ({"access_token": "ya29.fresh", "expires_in": 3600, "token_type": "Bearer"}
+                    if "/token" in req.full_url else {"totalTokens": 1})
+            return FakeResp(body)
+
+        mock_urlopen.side_effect = side_effect
+        with tempfile.TemporaryDirectory() as tmp:
+            # No client_id/client_secret — simulates a fresh `gemini` CLI
+            # re-login that rewrote the creds file.
+            creds = {
+                "access_token": "ya29.expired",
+                "refresh_token": "1//test-refresh-token",
+                "token_type": "Bearer",
+                "expiry_date": 0,  # long expired → forces a refresh
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }
+            p = Path(tmp) / "oauth_creds.json"
+            p.write_text(json.dumps(creds))
+            data = GeminiProvider(creds_file=str(p)).fetch()
+        self.assertTrue(data["ok"])
+        self.assertIn("refresh_token", captured_bodies[0])
+        self.assertIn("fake-cli-id", captured_bodies[0])
+        self.assertIn("fake-cli-secret", captured_bodies[0])
+
     @patch("providers.gemini.urlopen")
     def test_fetch_rate_limited_rpm(self, mock_urlopen):
         import tempfile

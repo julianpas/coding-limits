@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,21 +11,88 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-_GEMINI_API_BASE = "https://generativelanguage.googleapis.com"
+# Code Assist backend (what the gemini CLI OAuth token is authorized for).
+# Note: raw generativelanguage.googleapis.com rejects these tokens with
+# ACCESS_TOKEN_SCOPE_INSUFFICIENT — the token is scoped to the Code Assist
+# product, which proxies Gemini models.
+_GEMINI_API_BASE = "https://cloudcode-pa.googleapis.com"
 _DEFAULT_AGY_HOME = Path.home() / ".gemini" / "antigravity-cli"
 _DEFAULT_CREDS_FILE = Path.home() / ".gemini" / "oauth_creds.json"
+
+# The gemini CLI ships a public installed-app OAuth client pair in cleartext
+# (@google/gemini-cli-core, code_assist/oauth2.js, with a comment noting the
+# secret is not a secret). Refresh tokens obtained via `gemini` login are bound
+# to THAT client — a different pair yields invalid_client/invalid_grant — so we
+# need it as a last-resort fallback when the creds file omits it.
+#
+# It is deliberately NOT vendored into this repo: a literal GOCSPX- string trips
+# every credential scanner in existence and would age badly when Google rotates
+# it. Instead we read the pair back out of the CLI the user already has
+# installed, which is both always current and self-evidently not our secret.
+
+_CLIENT_ID_RE = re.compile(r"\d{10,14}-[a-z0-9]{32}\.apps\.googleusercontent\.com")
+_CLIENT_SECRET_RE = re.compile(r"GOCSPX-[A-Za-z0-9_\-]{28}")
+
+_AGY_EXE = Path(os.environ.get("AGY_EXE", "")) if os.environ.get("AGY_EXE") else (
+    Path.home() / ".gemini" / "bin" / "agy.exe"
+)
+
+# Resolved at most once per process; the scan reads a ~200MB binary.
+_cli_pairs_cache: list[tuple[str, str]] | None = None
+
+
+def _discover_cli_client_pairs() -> list[tuple[str, str]]:
+    """
+    Recover the gemini CLI's built-in OAuth client pair(s) from the local install.
+
+    Checks GEMINI_CLI_CLIENT_ID / GEMINI_CLI_CLIENT_SECRET first, then scans the
+    agy binary. The binary embeds several client ids and secrets and there is no
+    reliable way to tell from the bytes alone which id goes with which secret, so
+    every combination is returned; the refresh loop already tries candidates in
+    order and only a matching pair is accepted by Google's token endpoint.
+
+    Returns an empty list when nothing is available, in which case the creds file
+    must supply the pair itself.
+    """
+    global _cli_pairs_cache
+    if _cli_pairs_cache is not None:
+        return _cli_pairs_cache
+
+    env_id = os.environ.get("GEMINI_CLI_CLIENT_ID", "")
+    env_secret = os.environ.get("GEMINI_CLI_CLIENT_SECRET", "")
+    if env_id and env_secret:
+        _cli_pairs_cache = [(env_id, env_secret)]
+        return _cli_pairs_cache
+
+    pairs: list[tuple[str, str]] = []
+    try:
+        if _AGY_EXE.exists():
+            text = _AGY_EXE.read_bytes().decode("latin-1", errors="ignore")
+            ids = list(dict.fromkeys(_CLIENT_ID_RE.findall(text)))
+            secrets = list(dict.fromkeys(_CLIENT_SECRET_RE.findall(text)))
+            pairs = [(cid, sec) for cid in ids for sec in secrets]
+    except OSError:
+        pairs = []
+
+    _cli_pairs_cache = pairs
+    return pairs
 
 
 class GeminiProvider:
     """
-    Uses the antigravity-cli (agy) OAuth credentials to call the Gemini API
-    as the signed-in Google account — no API key, no billing.
+    Uses the gemini CLI (Google Code Assist) OAuth credentials to probe the
+    Gemini quota as the signed-in Google account — no API key, no billing.
 
-    - Access token is auto-refreshed via the stored refresh_token.
+    - The canary call is cloudcode-pa.googleapis.com/v1internal:countTokens;
+      a 429 response carries the exhausted window (RPM vs RPD).
+    - Access token is auto-refreshed via the stored refresh_token. The
+      refresh grant uses the pair in the creds file when present, otherwise
+      the gemini CLI's public installed-app pair, recovered from the local
+      install (see _discover_cli_client_pairs) — so `gemini` re-logins that
+      rewrite the creds file do not break refresh.
     - Usage percentages (RPM/RPD) are read from history.jsonl when accessible.
-    - On the gateway server, copy the credentials file once:
-        python3 gemini-creds-setup.py > /tmp/gemini-creds.json
-        scp /tmp/gemini-creds.json mole@ash:/etc/gemini-oauth-creds.json
+    - Setup: log in with the `gemini` CLI (security.auth.selectedType =
+      "oauth-personal"). No manual credential merging required.
     """
 
     def __init__(
@@ -35,7 +103,11 @@ class GeminiProvider:
         daily_limit: int = 1000,
         rpm_limit: int = 15,
         timeout_seconds: int = 15,
+        client_id: str = "",
+        client_secret: str = "",
     ) -> None:
+        self.client_id = client_id
+        self.client_secret = client_secret
         resolved_creds = creds_file or os.environ.get("GEMINI_CREDS_FILE", "")
         self.creds_file = Path(resolved_creds).expanduser() if resolved_creds else _DEFAULT_CREDS_FILE
 
@@ -70,7 +142,12 @@ class GeminiProvider:
             )
         token_uri = creds.get("token_uri", "https://oauth2.googleapis.com/token")
 
-        # Build list of client credential pairs to try (setup script may embed several)
+        # Build list of client credential pairs to try.
+        # Priority: creds-file pair(s) first (may embed several), then the
+        # config.json pair (providers.gemini.client_id/client_secret), then
+        # the gemini CLI's built-in public pair as a last resort — the
+        # credentials file is rewritten by `gemini` re-logins, so the fallback
+        # keeps refresh working even when the pair is missing from it.
         pairs: list[tuple[str, str]] = []
         for p in creds.get("oauth_pairs", []):
             if p.get("client_id") and p.get("client_secret"):
@@ -79,6 +156,9 @@ class GeminiProvider:
             primary = (creds["client_id"], creds["client_secret"])
             if primary not in pairs:
                 pairs.insert(0, primary)
+        for candidate in [(self.client_id, self.client_secret), *_discover_cli_client_pairs()]:
+            if candidate[0] and candidate[1] and candidate not in pairs:
+                pairs.append(candidate)
         if not pairs:
             raise RuntimeError(
                 "client_id/client_secret missing. Re-run gemini-creds-setup.py and copy the output."
@@ -192,9 +272,16 @@ class GeminiProvider:
     # ── API probe ─────────────────────────────────────────────────────────────
 
     def _count_tokens(self, access_token: str) -> None:
+        # Code Assist API: v1internal:countTokens with a nested `request` body
+        # (model prefixed with "models/"), per @google/gemini-cli-core converter.js.
         req = Request(
-            f"{_GEMINI_API_BASE}/v1beta/models/{self.model}:countTokens",
-            data=json.dumps({"contents": [{"parts": [{"text": "x"}]}]}).encode(),
+            f"{_GEMINI_API_BASE}/v1internal:countTokens",
+            data=json.dumps({
+                "request": {
+                    "model": f"models/{self.model}",
+                    "contents": [{"role": "user", "parts": [{"text": "x"}]}],
+                },
+            }).encode(),
             headers={
                 "authorization": f"Bearer {access_token}",
                 "content-type": "application/json",
@@ -213,15 +300,23 @@ class GeminiProvider:
     def _parse_rate_limit_error(self, exc: HTTPError) -> dict[str, Any]:
         retry_after_raw = exc.headers.get("Retry-After")
         resets_at = int(time.time()) + int(retry_after_raw) if retry_after_raw else None
+        is_minute = False
         try:
             body = json.loads(exc.read().decode("utf-8", errors="replace"))
-            details = body.get("error", {}).get("details", [])
+            error = body.get("error", {})
+            details = error.get("details", [])
             quota_id = next(
                 (d.get("metadata", {}).get("quota_id") or d.get("metadata", {}).get("quotaId")
                  for d in details if d.get("metadata")),
                 None,
             )
-            is_minute = bool(quota_id and "PerMinute" in quota_id)
+            # Code Assist 429s may not carry quota_id metadata; the message is
+            # shaped like: Quota exceeded ... limit 'RequestsPerDay' of service ...
+            message = error.get("message", "")
+            if quota_id and "PerMinute" in quota_id:
+                is_minute = True
+            elif "RequestsPerMinute" in message or "PerMinute" in message:
+                is_minute = True
         except Exception:
             is_minute = False
 

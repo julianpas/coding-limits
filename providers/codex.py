@@ -52,6 +52,10 @@ class CodexProvider:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            # codex.cmd is a console app: without this, a console-less parent
+            # (pythonw tray app) makes Windows pop a new console window on
+            # every fetch. NO_WINDOW suppresses it while pipes still work.
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
 
         try:
