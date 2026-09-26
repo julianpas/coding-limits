@@ -143,13 +143,13 @@ public sealed class Gateway
 
     // ── status ────────────────────────────────────────────────────────────────
 
-    public bool IsPortUp()
+    public bool IsPortUp(int timeoutMs = 750)
     {
         try
         {
             using var c = new TcpClient();
             var ar = c.BeginConnect("127.0.0.1", _port, null, null);
-            if (ar.AsyncWaitHandle.WaitOne(750) && c.Connected)
+            if (ar.AsyncWaitHandle.WaitOne(timeoutMs) && c.Connected)
             {
                 c.EndConnect(ar);
                 return true;
@@ -197,7 +197,9 @@ public sealed class Gateway
     {
         lock (_sync)
         {
-            if (IsPortUp())
+            // Short timeout: this runs on the UI thread every tick; a dead
+            // port must not freeze the window for hundreds of ms.
+            if (IsPortUp(50))
             {
                 _state = GatewayState.Running;
                 _lastError = null;

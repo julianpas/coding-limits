@@ -54,9 +54,7 @@ public sealed class HudForm : Form
     private bool _userStoppedGateway;
     private bool _exitStopsGateway;
 
-    private bool _dragging;
-    private Point _dragOrigin;
-    private Point _dragStart;
+    private bool _posDirty; // window moved; persist position on the next tick
 
     // ── DPI scale (1.0 at 96 dpi), derived from font metrics ───────────────
     private float S = 1f;
@@ -114,6 +112,10 @@ public sealed class HudForm : Form
         base.OnLoad(e);
         if (!_cfg.StartVisible)
             Visible = false;
+        // Recover if the saved position is off-screen (monitor gone / resolution change).
+        var r = new Rectangle(Location, ClientSize);
+        if (System.Linq.Enumerable.All(Screen.AllScreens, sc => !sc.Bounds.IntersectsWith(r)))
+            Location = new Point(8, 8);
         Relayout();
         FetchNow();
         if (_cfg.AutoStartGateway && _gw is not null)
@@ -341,6 +343,14 @@ public sealed class HudForm : Form
         bool due = !_fetchBusy && DateTime.UtcNow - _lastFetchStart >= TimeSpan.FromSeconds(_cfg.RefreshSeconds);
         if (due)
             FetchNow();
+
+        if (_posDirty)
+        {
+            _posDirty = false;
+            _cfg.X = Location.X;
+            _cfg.Y = Location.Y;
+            _cfg.Save();
+        }
 
         UpdateTrayState();
         Invalidate();
@@ -756,38 +766,21 @@ public sealed class HudForm : Form
         base.OnMouseDown(e);
         if (e.Button == MouseButtons.Left)
         {
-            _dragging = true;
-            _dragStart = e.Location;
-            _dragOrigin = Location;
+            // Hand the drag to the window manager (the same path as a normal
+            // title bar): 1:1 with the cursor, no per-move managed work, and
+            // no DPI coordinate-space mismatch between mouse deltas and Location.
+            ReleaseCapture();
+            SendMessage(Handle, WM_NCLBUTTONDOWN, (IntPtr)HTCAPTION, IntPtr.Zero);
         }
     }
 
-    protected override void OnMouseMove(MouseEventArgs e)
+    // The OS drag loop swallows the mouse-up, so persist the new position on
+    // the next tick instead of OnMouseUp (debounced: one file write, not one
+    // per pixel).
+    protected override void OnLocationChanged(EventArgs e)
     {
-        base.OnMouseMove(e);
-        if (!_dragging)
-            return;
-        var wa = Screen.FromPoint(Location).WorkingArea;
-        int nx = _dragOrigin.X + (e.X - _dragStart.X);
-        int ny = _dragOrigin.Y + (e.Y - _dragStart.Y);
-        nx = Math.Clamp(nx, wa.Left - ClientSize.Width / 2, wa.Right - ClientSize.Width / 2);
-        ny = Math.Clamp(ny, wa.Top, wa.Bottom - 32);
-        Location = new Point(nx, ny);
-    }
-
-    protected override void OnMouseUp(MouseEventArgs e)
-    {
-        base.OnMouseUp(e);
-        if (_dragging && e.Button == MouseButtons.Left)
-        {
-            _dragging = false;
-            if (Math.Abs(e.X - _dragStart.X) + Math.Abs(e.Y - _dragStart.Y) > 3)
-            {
-                _cfg.X = Location.X;
-                _cfg.Y = Location.Y;
-                _cfg.Save();
-            }
-        }
+        base.OnLocationChanged(e);
+        _posDirty = true;
     }
 
     // ── win32 ────────────────────────────────────────────────────────────────
@@ -803,4 +796,13 @@ public sealed class HudForm : Form
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool DestroyIcon(IntPtr hIcon);
+
+    [DllImport("user32.dll")]
+    private static extern bool ReleaseCapture();
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+    private const int WM_NCLBUTTONDOWN = 0x00A1;
+    private const int HTCAPTION = 2;
 }
