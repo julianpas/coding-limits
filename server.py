@@ -63,6 +63,7 @@ def load_config() -> dict[str, Any]:
                 "timeout_seconds": 15,
                 "client_id": "",
                 "client_secret": "",
+                "project": "",
             },
         },
     }
@@ -165,6 +166,7 @@ def apply_env_overrides(config: dict[str, Any]) -> None:
     gemini_cfg["daily_limit"] = parse_env_int("GEMINI_DAILY_LIMIT", int(gemini_cfg["daily_limit"]))
     gemini_cfg["rpm_limit"] = parse_env_int("GEMINI_RPM_LIMIT", int(gemini_cfg["rpm_limit"]))
     gemini_cfg["timeout_seconds"] = parse_env_int("GEMINI_TIMEOUT_SECONDS", int(gemini_cfg["timeout_seconds"]))
+    gemini_cfg["project"] = os.environ.get("GEMINI_PROJECT", gemini_cfg.get("project", ""))
 
 
 def fetch_with_retry(provider: Any, name: str, max_attempts: int = 2) -> dict[str, Any]:
@@ -225,6 +227,7 @@ def build_snapshot(config: dict[str, Any]) -> dict[str, Any]:
                 "timeout_seconds": int(providers_cfg.get("gemini", {}).get("timeout_seconds", 15)),
                 "client_id": providers_cfg.get("gemini", {}).get("client_id", ""),
                 "client_secret": providers_cfg.get("gemini", {}).get("client_secret", ""),
+                "project": providers_cfg.get("gemini", {}).get("project", ""),
             },
         ),
     ]

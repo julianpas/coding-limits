@@ -119,11 +119,13 @@ CLAUDE_SESSION_KEY=sk-ant-sid-...
 
 ### Enabling Gemini
 
-The Gemini provider uses the same OAuth credentials as the Gemini CLI — **no API key, no billing**. It probes the Code Assist backend that the `gemini` CLI itself uses (`cloudcode-pa.googleapis.com/v1internal:countTokens`) as your Google account's personal free quota, and auto-refreshes the access token using the stored refresh token.
+The Gemini provider reads your **real Antigravity usage quota** — **no API key, no billing**. It calls the Code Assist backend the Antigravity IDE/CLI itself uses (`cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`) and reports the live **weekly** and rolling **5-hour** limits for the Gemini model group (the same numbers Antigravity shows), auto-refreshing the access token from the stored refresh token.
+
+> This endpoint is licensed by OAuth client **and** user-agent: it only accepts a token minted for the **Antigravity** client, sent with the Antigravity CLI user-agent. A plain `gemini` CLI login is rejected with `403 PERMISSION_DENIED`, which is why the credentials must come from `export-gemini-creds.py` (below), not a bare `gemini login`.
 
 **One-time setup:**
 
-1. On the gateway machine, log in with the Gemini CLI (`gemini`, with `security.auth.selectedType: "oauth-personal"` in `~/.gemini/settings.json`) and complete the browser sign-in. This creates `~/.gemini/oauth_creds.json`.
+1. On the machine where you signed into **Antigravity**, run `export-gemini-creds.py` in a normal terminal. It reads the Antigravity OAuth token from the OS credential store and writes `~/.gemini/oauth_creds.json` with the refresh token **and** the Antigravity client pairs (`oauth_pairs`). (On Windows, run it from a real PowerShell/Terminal window, not inside a sandbox that intercepts the credential API.)
 2. Enable the provider in `config.json` (or via env):
 
 ```json
@@ -140,11 +142,9 @@ GEMINI_ENABLED=true
 2. `providers.gemini.client_id`/`client_secret` in `config.json`,
 3. the gemini CLI's public installed-app pair, built into the provider (it is a public constant in `@google/gemini-cli-core`).
 
-Because of the built-in fallback, re-logging in with the `gemini` CLI (which rewrites the credentials file without the pair) does **not** break refresh — the provider falls back to the CLI pair and writes it back into the file.
+Because the credentials file carries the Antigravity `oauth_pairs`, refresh keeps working on its own. When Google eventually invalidates the refresh token (rare — typically only on password change or account revocation), re-run `export-gemini-creds.py` after signing into Antigravity again.
 
-When Google eventually invalidates the refresh token (rare — typically only on password change or account revocation), re-login with the `gemini` CLI.
-
-> **Note:** Google does not expose remaining quota in successful API responses, so `usedPercent` will be `null` when not rate-limited. The bars on the display will show `--`. If a 429 is hit, the relevant window (RPM or RPD) fills to 100% with a reset countdown.
+> **Note:** `shortWindow` is the rolling **5-hour** limit and `longWindow` is the **weekly** limit, each shown as percent **remaining** with a reset countdown (matching the other providers' gauges). If a window is fully exhausted it reads 0% remaining and `rateLimitReachedType` is set (`"5h"` or `"weekly"`). The project the quota call is scoped to defaults to `aicode-consumers`; override with `GEMINI_PROJECT` or `providers.gemini.project` if needed.
 
 ### Securing the endpoint
 
@@ -209,8 +209,8 @@ Requires `X-Gauge-Token` header if `ACCESS_TOKEN` is set. Calls all enabled prov
       "ok": true,
       "source": "gemini-cli-logs",
       "planType": "personal",
-      "shortWindow": { "label": "RPM", "usedPercent": 6.7, "remainingPercent": 93, "windowDurationMins": 1, "resetsAt": null },
-      "longWindow":  { "label": "RPD", "usedPercent": 12.0, "remainingPercent": 88, "windowDurationMins": 1440, "resetsAt": null },
+      "shortWindow": { "label": "5h", "usedPercent": 23.5, "remainingPercent": 76.5, "windowDurationMins": 300, "resetsAt": 1791053327 },
+      "longWindow":  { "label": "Weekly", "usedPercent": 5.9, "remainingPercent": 94.1, "windowDurationMins": 10080, "resetsAt": 1791047193 },
       "error": null
     }
   }

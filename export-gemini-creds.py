@@ -76,39 +76,47 @@ class CREDENTIALA(ctypes.Structure):
 
 def read_credential(target: str) -> dict[str, Any]:
     adv = ctypes.WinDLL("advapi32", use_last_error=True)
+    pcred = ctypes.POINTER(CREDENTIALA)
+    # CredReadW's last arg is PCREDENTIAL* — it allocates the credential and
+    # writes its address into our out-param. Passing a pre-allocated struct
+    # (the old bug) leaves it uninitialized, so we read garbage / a 0-byte blob.
     adv.CredReadW.argtypes = [
-        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(CREDENTIALA)
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(pcred)
     ]
     adv.CredReadW.restype = wintypes.BOOL
-    cred = CREDENTIALA()
-    if not adv.CredReadW(target, 1, 0, ctypes.byref(cred)):  # 1 = generic
+    adv.CredFree.argtypes = [ctypes.c_void_p]
+    adv.CredFree.restype = None
+
+    ptr = pcred()
+    if not adv.CredReadW(target, 1, 0, ctypes.byref(ptr)):  # 1 = generic
         err = ctypes.get_last_error()
         raise RuntimeError(f"CredReadW({target!r}) failed — Win32 error {err}")
 
-    info: dict[str, Any] = {
-        "target": cred.TargetName,
-        "flags": cred.Flags,
-        "type": cred.Type,
-        "persist": cred.Persist,
-        "comment": cred.Comment or "",
-        "blob": b"",
-        "attributes": [],
-    }
-    if cred.CredentialBlobSize and cred.CredentialBlob:
-        buf = (ctypes.c_byte * cred.CredentialBlobSize).from_address(cred.CredentialBlob)
-        info["blob"] = bytes(buf)
+    try:
+        cred = ptr.contents
+        info: dict[str, Any] = {
+            "target": cred.TargetName,
+            "flags": cred.Flags,
+            "type": cred.Type,
+            "persist": cred.Persist,
+            "comment": cred.Comment or "",
+            "blob": b"",
+            "attributes": [],
+        }
+        if cred.CredentialBlobSize and cred.CredentialBlob:
+            info["blob"] = ctypes.string_at(cred.CredentialBlob, cred.CredentialBlobSize)
 
-    if cred.AttributeCount and cred.Attribute:
-        arr = cred.Attribute
-        for i in range(cred.AttributeCount):
-            a = arr[i]
-            raw = b""
-            if a.ValueLength and a.Value:
-                buf = (ctypes.c_byte * a.ValueLength).from_address(a.Value)
-                raw = bytes(buf)
-            info["attributes"].append((a.Name or f"attr{i}", a.ValueType, raw))
+        if cred.AttributeCount and cred.Attribute:
+            for i in range(cred.AttributeCount):
+                a = cred.Attribute[i]
+                raw = b""
+                if a.ValueLength and a.Value:
+                    raw = ctypes.string_at(a.Value, a.ValueLength)
+                info["attributes"].append((a.Name or f"attr{i}", a.ValueType, raw))
 
-    return info
+        return info
+    finally:
+        adv.CredFree(ptr)
 
 
 # ── Secret parsing ────────────────────────────────────────────────────────────

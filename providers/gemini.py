@@ -11,12 +11,20 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-# Code Assist backend (what the gemini CLI OAuth token is authorized for).
-# Note: raw generativelanguage.googleapis.com rejects these tokens with
-# ACCESS_TOKEN_SCOPE_INSUFFICIENT — the token is scoped to the Code Assist
-# product, which proxies Gemini models.
+# Code Assist backend. The Antigravity free tier exposes real usage via
+# v1internal:retrieveUserQuotaSummary — a weekly limit and a rolling 5-hour
+# limit per model group, each as a remainingFraction with a resetTime.
+# The endpoint licenses by OAuth client *and* user-agent: it only accepts a
+# token minted for the Antigravity client (see oauth_pairs, written by
+# export-gemini-creds.py) sent with the Antigravity CLI user-agent.
 _GEMINI_API_BASE = "https://cloudcode-pa.googleapis.com"
-_DEFAULT_AGY_HOME = Path.home() / ".gemini" / "antigravity-cli"
+_QUOTA_ENDPOINT = "/v1internal:retrieveUserQuotaSummary"
+_ANTIGRAVITY_UA = (
+    "antigravity/cli/1.2.16 (aidev_client; os_type=windows; arch=amd64; auth_method=consumer)"
+)
+# The consumer/free-tier project the quota call is scoped to (same for every
+# individual account); overridable via GEMINI_PROJECT.
+_CONSUMER_PROJECT = "aicode-consumers"
 _DEFAULT_CREDS_FILE = Path.home() / ".gemini" / "oauth_creds.json"
 
 # The gemini CLI ships a public installed-app OAuth client pair in cleartext
@@ -80,19 +88,21 @@ def _discover_cli_client_pairs() -> list[tuple[str, str]]:
 
 class GeminiProvider:
     """
-    Uses the gemini CLI (Google Code Assist) OAuth credentials to probe the
-    Gemini quota as the signed-in Google account — no API key, no billing.
+    Reads the real Antigravity usage quota as the signed-in Google account —
+    no API key, no billing.
 
-    - The canary call is cloudcode-pa.googleapis.com/v1internal:countTokens;
-      a 429 response carries the exhausted window (RPM vs RPD).
-    - Access token is auto-refreshed via the stored refresh_token. The
-      refresh grant uses the pair in the creds file when present, otherwise
-      the gemini CLI's public installed-app pair, recovered from the local
-      install (see _discover_cli_client_pairs) — so `gemini` re-logins that
-      rewrite the creds file do not break refresh.
-    - Usage percentages (RPM/RPD) are read from history.jsonl when accessible.
-    - Setup: log in with the `gemini` CLI (security.auth.selectedType =
-      "oauth-personal"). No manual credential merging required.
+    - The data source is cloudcode-pa.googleapis.com/v1internal:
+      retrieveUserQuotaSummary, which reports the live weekly and rolling
+      5-hour limits for the Gemini model group as remainingFraction + resetTime
+      (this is exactly what the Antigravity IDE shows).
+    - The call must use the Antigravity OAuth credentials (oauth_pairs written
+      by export-gemini-creds.py) sent with the Antigravity CLI user-agent;
+      a plain gemini-CLI login is rejected with 403 PERMISSION_DENIED.
+    - Access token is auto-refreshed via the stored refresh_token, trying the
+      creds-file pair(s) first, then the gemini CLI's public installed-app
+      pair recovered from the local install (see _discover_cli_client_pairs).
+    - Setup (once): run export-gemini-creds.py after logging in with Antigravity
+      so oauth_creds.json carries the Antigravity refresh token + oauth_pairs.
     """
 
     def __init__(
@@ -105,18 +115,16 @@ class GeminiProvider:
         timeout_seconds: int = 15,
         client_id: str = "",
         client_secret: str = "",
+        project: str = "",
     ) -> None:
         self.client_id = client_id
         self.client_secret = client_secret
         resolved_creds = creds_file or os.environ.get("GEMINI_CREDS_FILE", "")
         self.creds_file = Path(resolved_creds).expanduser() if resolved_creds else _DEFAULT_CREDS_FILE
 
-        resolved_history = history_file or os.environ.get("GEMINI_HISTORY_FILE", "")
-        self.history_file = (
-            Path(resolved_history).expanduser() if resolved_history
-            else _DEFAULT_AGY_HOME / "history.jsonl"
-        )
+        self.project = project or os.environ.get("GEMINI_PROJECT", "") or _CONSUMER_PROJECT
 
+        # Retained for config/back-compat; not used by the quota-summary path.
         self.model = model
         self.daily_limit = daily_limit
         self.rpm_limit = rpm_limit
@@ -128,7 +136,7 @@ class GeminiProvider:
         if not self.creds_file.exists():
             raise RuntimeError(
                 f"Gemini OAuth credentials not found at {self.creds_file}. "
-                "Run gemini-creds-setup.py on your dev machine and copy the output to this server, "
+                "Run export-gemini-creds.py (after an Antigravity login) to write it, "
                 "then set GEMINI_CREDS_FILE."
             )
         with self.creds_file.open("r", encoding="utf-8") as fh:
@@ -208,144 +216,112 @@ class GeminiProvider:
             creds = self._refresh_access_token(creds)
         return creds["access_token"]
 
-    # ── History counting ──────────────────────────────────────────────────────
+    # ── Quota summary ─────────────────────────────────────────────────────────
 
-    def _count_from_history(self) -> tuple[int | None, int | None]:
-        """Parse history.jsonl to get (daily_used, rpm_used). Returns (None, None) if unavailable."""
-        if not self.history_file.exists():
-            return None, None
+    def _retrieve_quota_summary(self, access_token: str) -> dict[str, Any]:
+        """
+        Call the Code Assist quota API as the Antigravity CLI does.
 
-        now_ms = time.time() * 1000
-        today_start_ms = datetime.now(timezone.utc).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        ).timestamp() * 1000
-        minute_start_ms = now_ms - 60_000
-
-        daily, rpm = 0, 0
-        try:
-            with self.history_file.open("r", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    ts = entry.get("timestamp", 0)
-                    display = entry.get("display", "")
-                    if not display or display.startswith("/"):
-                        continue
-                    if ts >= today_start_ms:
-                        daily += 1
-                    if ts >= minute_start_ms:
-                        rpm += 1
-        except OSError:
-            return None, None
-
-        return daily, rpm
-
-    # ── Window builders ───────────────────────────────────────────────────────
-
-    def _make_window(
-        self, label: str, used: int | None, limit: int, duration_mins: int
-    ) -> dict[str, Any]:
-        if used is None:
-            return {
-                "label": label, "usedPercent": None, "remainingPercent": None,
-                "windowDurationMins": duration_mins, "resetsAt": None,
-            }
-        used_pct = round(min(100, used / limit * 100), 1) if limit > 0 else None
-        remaining_pct = max(0, 100 - int(used_pct)) if used_pct is not None else None
-        return {
-            "label": label, "usedPercent": used_pct, "remainingPercent": remaining_pct,
-            "windowDurationMins": duration_mins, "resetsAt": None,
-        }
-
-    @staticmethod
-    def _exhausted_window(label: str, resets_at: int | None, duration_mins: int) -> dict[str, Any]:
-        return {
-            "label": label, "usedPercent": 100, "remainingPercent": 0,
-            "windowDurationMins": duration_mins, "resetsAt": resets_at,
-        }
-
-    # ── API probe ─────────────────────────────────────────────────────────────
-
-    def _count_tokens(self, access_token: str) -> None:
-        # Code Assist API: v1internal:countTokens with a nested `request` body
-        # (model prefixed with "models/"), per @google/gemini-cli-core converter.js.
+        The endpoint licenses by OAuth client *and* user-agent: only a token
+        minted for the Antigravity client (the oauth_pairs written by
+        export-gemini-creds.py) combined with the Antigravity CLI user-agent is
+        authorized. A gemini-CLI token, or a generic user-agent, is rejected
+        with 403 PERMISSION_DENIED / UNSUPPORTED_CLIENT.
+        """
         req = Request(
-            f"{_GEMINI_API_BASE}/v1internal:countTokens",
-            data=json.dumps({
-                "request": {
-                    "model": f"models/{self.model}",
-                    "contents": [{"role": "user", "parts": [{"text": "x"}]}],
-                },
-            }).encode(),
+            f"{_GEMINI_API_BASE}{_QUOTA_ENDPOINT}",
+            data=json.dumps({"project": self.project}).encode(),
             headers={
                 "authorization": f"Bearer {access_token}",
                 "content-type": "application/json",
-                "user-agent": "coding-limits-gateway/0.3.0",
+                "user-agent": _ANTIGRAVITY_UA,
             },
             method="POST",
         )
         try:
             with urlopen(req, timeout=self.timeout_seconds) as resp:
-                resp.read()
+                return json.loads(resp.read().decode("utf-8"))
         except HTTPError as exc:
-            raise exc
+            body = exc.read().decode("utf-8", errors="replace")
+            if exc.code == 403:
+                raise RuntimeError(
+                    "gemini quota API returned 403 PERMISSION_DENIED — the token is not "
+                    "authorized for Antigravity. Re-run export-gemini-creds.py so "
+                    f"{self.creds_file} carries the Antigravity credentials. Body: {body[:200]}"
+                ) from exc
+            raise RuntimeError(f"gemini quota HTTP {exc.code}: {body[:200]}") from exc
         except URLError as exc:
             raise RuntimeError(f"gemini connection error: {exc}") from exc
 
-    def _parse_rate_limit_error(self, exc: HTTPError) -> dict[str, Any]:
-        retry_after_raw = exc.headers.get("Retry-After")
-        resets_at = int(time.time()) + int(retry_after_raw) if retry_after_raw else None
-        is_minute = False
-        try:
-            body = json.loads(exc.read().decode("utf-8", errors="replace"))
-            error = body.get("error", {})
-            details = error.get("details", [])
-            quota_id = next(
-                (d.get("metadata", {}).get("quota_id") or d.get("metadata", {}).get("quotaId")
-                 for d in details if d.get("metadata")),
-                None,
-            )
-            # Code Assist 429s may not carry quota_id metadata; the message is
-            # shaped like: Quota exceeded ... limit 'RequestsPerDay' of service ...
-            message = error.get("message", "")
-            if quota_id and "PerMinute" in quota_id:
-                is_minute = True
-            elif "RequestsPerMinute" in message or "PerMinute" in message:
-                is_minute = True
-        except Exception:
-            is_minute = False
+    # ── Window builders ───────────────────────────────────────────────────────
 
-        short = self._exhausted_window("RPM", resets_at, 1) if is_minute else self._make_window("RPM", None, self.rpm_limit, 1)
-        long_ = self._make_window("RPD", None, self.daily_limit, 1440) if is_minute else self._exhausted_window("RPD", resets_at, 1440)
+    @staticmethod
+    def _gemini_group(summary: dict[str, Any]) -> dict[str, Any]:
+        """Return the model group that holds the Gemini buckets (Flash/Pro)."""
+        groups = summary.get("groups", []) if isinstance(summary, dict) else []
+        for group in groups:
+            for bucket in group.get("buckets", []):
+                if str(bucket.get("bucketId", "")).startswith("gemini"):
+                    return group
+        return groups[0] if groups else {}
+
+    @staticmethod
+    def _bucket(group: dict[str, Any], window: str) -> dict[str, Any] | None:
+        buckets = group.get("buckets", [])
+        for bucket in buckets:
+            if bucket.get("window") == window and str(bucket.get("bucketId", "")).startswith("gemini"):
+                return bucket
+        for bucket in buckets:  # fall back to any bucket for this window
+            if bucket.get("window") == window:
+                return bucket
+        return None
+
+    @staticmethod
+    def _window_from_bucket(
+        bucket: dict[str, Any] | None, label: str, duration_mins: int
+    ) -> dict[str, Any]:
+        if not bucket:
+            return {
+                "label": label, "usedPercent": None, "remainingPercent": None,
+                "windowDurationMins": duration_mins, "resetsAt": None,
+            }
+
+        frac = bucket.get("remainingFraction")
+        if frac is None:
+            used_pct = remaining_pct = None
+        else:
+            remaining_pct = max(0.0, min(100.0, round(float(frac) * 100, 1)))
+            used_pct = round(100.0 - remaining_pct, 1)
+
+        reset_epoch = None
+        reset_time = bucket.get("resetTime")
+        if reset_time:
+            try:
+                dt = datetime.fromisoformat(str(reset_time).replace("Z", "+00:00"))
+                reset_epoch = int(dt.astimezone(timezone.utc).timestamp())
+            except ValueError:
+                reset_epoch = None
+
         return {
-            "enabled": True, "ok": False, "source": "gemini-oauth",
-            "planType": "personal", "limitId": "gemini",
-            "shortWindow": short, "longWindow": long_,
-            "credits": None,
-            "rateLimitReachedType": "rpm" if is_minute else "rpd",
-            "error": "Rate limit exceeded (" + ("RPM" if is_minute else "RPD") + ")."
-                     + (f" Resets in {retry_after_raw}s." if retry_after_raw else ""),
+            "label": label, "usedPercent": used_pct, "remainingPercent": remaining_pct,
+            "windowDurationMins": duration_mins, "resetsAt": reset_epoch,
         }
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def fetch(self) -> dict[str, Any]:
         access_token = self._get_access_token()
+        summary = self._retrieve_quota_summary(access_token)
 
-        try:
-            self._count_tokens(access_token)
-        except HTTPError as exc:
-            if exc.code == 429:
-                return self._parse_rate_limit_error(exc)
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"gemini HTTP {exc.code}: {body[:200]}") from exc
+        group = self._gemini_group(summary)
+        short = self._window_from_bucket(self._bucket(group, "5h"), "5h", 300)
+        long_ = self._window_from_bucket(self._bucket(group, "weekly"), "Weekly", 10080)
 
-        daily_used, rpm_used = self._count_from_history()
+        rate_type = None
+        if short["remainingPercent"] == 0:
+            rate_type = "5h"
+        elif long_["remainingPercent"] == 0:
+            rate_type = "weekly"
 
         return {
             "enabled": True,
@@ -353,9 +329,9 @@ class GeminiProvider:
             "source": "gemini-oauth",
             "planType": "personal",
             "limitId": "gemini",
-            "shortWindow": self._make_window("RPM", rpm_used, self.rpm_limit, 1),
-            "longWindow": self._make_window("RPD", daily_used, self.daily_limit, 1440),
+            "shortWindow": short,
+            "longWindow": long_,
             "credits": None,
-            "rateLimitReachedType": None,
+            "rateLimitReachedType": rate_type,
             "error": None,
         }
